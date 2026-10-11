@@ -14,6 +14,10 @@
   cable comes out.
 */
 
+// Must stay above every function: the Arduino IDE auto-inserts function
+// prototypes before the first function, and they use this type.
+enum Status { UNKNOWN, ALERT, TIRED, DROWSY, NOFACE, CALIBRATING };
+
 // =================================================================== MOTOR WIRING
 // Written for an L298N / L9110 / TB6612-style driver: one PWM pin + two direction
 // pins per motor. Change the pins to match your wiring (PWM pins must be ~ pins).
@@ -65,8 +69,6 @@ void setMotors(int left, int right) {
 }
 
 // =================================================================== status
-
-enum Status { UNKNOWN, ALERT, TIRED, DROWSY, NOFACE, CALIBRATING };
 
 Status current = UNKNOWN;
 unsigned long lastStatusAt = 0;
