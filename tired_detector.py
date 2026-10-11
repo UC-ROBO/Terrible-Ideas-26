@@ -6,6 +6,7 @@ Webcam -> MediaPipe Face Landmarker -> Eye Aspect Ratio (EAR) + Mouth Aspect Rat
        -> status sent to an Arduino over USB serial
 
 Setup (Raspberry Pi OS 64-bit):
+    sudo apt install espeak-ng          # offline text-to-speech
     pip install mediapipe opencv-python numpy pyserial
 
 Run:
@@ -13,6 +14,7 @@ Run:
     python drowsiness_poc.py --headless               # no window (e.g. no monitor / over SSH)
     python drowsiness_poc.py --port /dev/ttyACM0      # pick the Arduino port explicitly
     python drowsiness_poc.py --no-serial              # run without an Arduino (laptop testing)
+    python drowsiness_poc.py --no-tts                 # no spoken messages
 
 The first run downloads the face landmarker model (~4 MB) next to this script.
 For the first 3 seconds, look at the camera with your eyes open to calibrate.
@@ -28,6 +30,9 @@ Keys (window mode):  q = quit   c = recalibrate
 import argparse
 import glob
 import os
+import random
+import shutil
+import subprocess
 import sys
 import time
 import urllib.request
@@ -71,6 +76,25 @@ YAWNS_TIRED = 2
 
 BAUD = 115200
 HEARTBEAT_SECONDS = 1.0
+
+# --------------------------------------------------------------------------- spoken messages
+# One message is picked at random each time the status changes to that state.
+# PLACEHOLDERS - replace or add as many lines as you like. To speak on another state
+# (e.g. "ALERT" or "NO FACE"), just add a new key with its own list.
+VOICE_MESSAGES = {
+    "TIRED": [
+        "Have a Redbull.",
+        "YEET.",
+        "Fly, you fool.",
+    ],
+    "DROWSY": [
+        "You need this Redbull.",
+        "Think Fast Chucklenuts.",
+        "You look like hell.",
+    ],
+}
+SPEECH_COOLDOWN = 5.0   # seconds; stops repeats if the status flickers between states
+SPEECH_RATE = 160       # words per minute (espeak-ng / say)
 
 COLOURS = {  # BGR
     "ALERT": (80, 200, 80),
@@ -148,6 +172,74 @@ class ArduinoLink:
         self.ser = None
 
 
+# --------------------------------------------------------------------------- text to speech
+
+class Speaker:
+    """Speaks a random message from VOICE_MESSAGES when the status changes.
+
+    Runs the OS speech engine as a background process, so the detector never pauses
+    while it talks. Linux/Pi: espeak-ng (sudo apt install espeak-ng). macOS: built-in `say`.
+    """
+
+    def __init__(self, messages=VOICE_MESSAGES):
+        self.messages = messages
+        self.proc = None
+        self.last_message = {}
+        self.last_spoken_at = 0.0
+        self.engine = self._find_engine()
+        if self.engine is None:
+            print("No speech engine found - messages will only be printed. "
+                  "On the Pi: sudo apt install espeak-ng")
+
+    @staticmethod
+    def _find_engine():
+        for name in ("espeak-ng", "espeak", "say"):
+            if shutil.which(name):
+                return name
+        return None
+
+    def pick(self, status):
+        """Random message for this status, avoiding the one used last time."""
+        options = self.messages.get(status)
+        if not options:
+            return None
+        choices = [m for m in options if m != self.last_message.get(status)] or options
+        msg = random.choice(choices)
+        self.last_message[status] = msg
+        return msg
+
+    def on_status_change(self, status, prev_status):
+        if status not in self.messages:
+            return
+        now = time.monotonic()
+        escalating = status == "DROWSY" and prev_status != "DROWSY"
+        if not escalating and now - self.last_spoken_at < SPEECH_COOLDOWN:
+            return
+        msg = self.pick(status)
+        if msg:
+            self.say(msg)
+            self.last_spoken_at = now
+
+    def say(self, text):
+        print(f"Speaking: {text}")
+        if self.engine is None:
+            return
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()  # newer message wins (e.g. DROWSY interrupts TIRED)
+        rate_flag = ["-r", str(SPEECH_RATE)] if self.engine == "say" else ["-s", str(SPEECH_RATE)]
+        try:
+            self.proc = subprocess.Popen(
+                [self.engine, *rate_flag, text],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except OSError as e:
+            print(f"Speech failed: {e}")
+
+    def close(self):
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+
+
 # --------------------------------------------------------------------------- detection
 
 def ensure_model():
@@ -187,6 +279,7 @@ def parse_args():
     ap.add_argument("--port", help="Arduino serial port (default: auto-detect)")
     ap.add_argument("--no-serial", action="store_true", help="don't talk to an Arduino")
     ap.add_argument("--headless", action="store_true", help="no preview window")
+    ap.add_argument("--no-tts", action="store_true", help="don't speak messages")
     return ap.parse_args()
 
 
@@ -207,6 +300,7 @@ def main():
         raise SystemExit("Couldn't open the camera (try --camera 1).")
 
     arduino = None if args.no_serial else ArduinoLink(args.port)
+    speaker = None if args.no_tts else Speaker()
 
     # State
     baseline = None
@@ -290,6 +384,8 @@ def main():
                 if status != prev_status:
                     print(f"{time.strftime('%H:%M:%S')}  {status}"
                           f"  (PERCLOS {perclos * 100:.0f}%, yawns {len(yawn_times)})")
+                    if speaker:
+                        speaker.on_status_change(status, prev_status)
                     prev_status = status
 
                 fps_n += 1
@@ -336,6 +432,8 @@ def main():
     finally:
         if arduino:
             arduino.close()
+        if speaker:
+            speaker.close()
         cap.release()
         cv2.destroyAllWindows()
 
