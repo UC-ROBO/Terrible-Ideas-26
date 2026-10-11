@@ -15,20 +15,20 @@ Run:
     python drowsiness_poc.py --port /dev/ttyACM0      # pick the Arduino port explicitly
     python drowsiness_poc.py --no-serial              # run without an Arduino (laptop testing)
     python drowsiness_poc.py --no-tts                 # no spoken messages
+    python drowsiness_poc.py --drive                  # also drive the robot with the keyboard
+    python teleop.py                                  # just drive, no camera
 
+Needs arduino_link.py and teleop.py in the same folder.
 The first run downloads the face landmarker model (~4 MB) next to this script.
 For the first 3 seconds, look at the camera with your eyes open to calibrate.
 
-Serial protocol (115200 baud, one line per message):
-    Pi -> Arduino:  ALERT | TIRED | DROWSY | NOFACE | CALIBRATING
-    Sent immediately when the status changes, and repeated every second as a heartbeat
-    so the Arduino can tell if the Pi has stopped.
+Serial protocol: see arduino_link.py.
 
 Keys (window mode):  q = quit   c = recalibrate
+With --drive:        w/a/s/d or arrows = drive, x/space = stop, +/- = speed
 """
 
 import argparse
-import glob
 import os
 import random
 import shutil
@@ -49,6 +49,9 @@ import mediapipe as mp
 import numpy as np
 from mediapipe.tasks import python as mp_tasks
 from mediapipe.tasks.python import vision
+
+from arduino_link import ArduinoLink
+from teleop import KeyboardTeleop
 
 MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/face_landmarker/"
@@ -73,9 +76,6 @@ YAWN_WINDOW = 60.0       # seconds
 PERCLOS_TIRED = 0.15
 PERCLOS_DROWSY = 0.25
 YAWNS_TIRED = 2
-
-BAUD = 115200
-HEARTBEAT_SECONDS = 1.0
 
 # --------------------------------------------------------------------------- spoken messages
 # One message is picked at random each time the status changes to that state.
@@ -103,73 +103,6 @@ COLOURS = {  # BGR
     "CALIBRATING": (200, 200, 200),
     "NO FACE": (150, 150, 150),
 }
-
-
-# --------------------------------------------------------------------------- Arduino link
-
-class ArduinoLink:
-    """Sends the current status to the Arduino. Never crashes the detector if the board
-    is missing or gets unplugged - it just keeps trying to reconnect."""
-
-    def __init__(self, port=None):
-        self.port_arg = port
-        self.ser = None
-        self.last_sent = None
-        self.last_sent_at = 0.0
-        self.next_retry = 0.0
-
-    @staticmethod
-    def find_port():
-        candidates = sorted(glob.glob("/dev/ttyACM*") + glob.glob("/dev/ttyUSB*"))
-        return candidates[0] if candidates else None
-
-    def _connect(self):
-        import serial  # pyserial
-
-        port = self.port_arg or self.find_port()
-        if not port:
-            return
-        try:
-            self.ser = serial.Serial(port, BAUD, timeout=0)
-            time.sleep(2)  # most Arduinos reset when the port opens; wait for the bootloader
-            self.ser.reset_input_buffer()
-            print(f"Arduino connected on {port}")
-        except Exception as e:  # noqa: BLE001
-            print(f"Couldn't open {port}: {e}")
-            self.ser = None
-
-    def send(self, status):
-        now = time.monotonic()
-        if self.ser is None:
-            if now < self.next_retry:
-                return
-            self.next_retry = now + 3.0
-            self._connect()
-            if self.ser is None:
-                return
-            self.last_sent = None  # force a send after reconnecting
-
-        msg = status.replace(" ", "")  # "NO FACE" -> "NOFACE"
-        if msg == self.last_sent and now - self.last_sent_at < HEARTBEAT_SECONDS:
-            return
-        try:
-            self.ser.write(f"{msg}\n".encode())
-            self.last_sent, self.last_sent_at = msg, now
-            # Print anything the Arduino says back (handy for debugging the sketch)
-            reply = self.ser.read(self.ser.in_waiting or 0)
-            if reply:
-                print("Arduino:", reply.decode(errors="replace").strip())
-        except Exception as e:  # noqa: BLE001
-            print(f"Lost Arduino connection: {e}")
-            self.close()
-
-    def close(self):
-        if self.ser is not None:
-            try:
-                self.ser.close()
-            except Exception:  # noqa: BLE001
-                pass
-        self.ser = None
 
 
 # --------------------------------------------------------------------------- text to speech
@@ -280,6 +213,10 @@ def parse_args():
     ap.add_argument("--no-serial", action="store_true", help="don't talk to an Arduino")
     ap.add_argument("--headless", action="store_true", help="no preview window")
     ap.add_argument("--no-tts", action="store_true", help="don't speak messages")
+    ap.add_argument("--drive", action="store_true",
+                    help="also drive the robot with the keyboard (see teleop.py for keys)")
+    ap.add_argument("--hold", action="store_true", help="with --drive: only move while a key is held")
+    ap.add_argument("--speed", type=int, default=150, help="with --drive: starting speed 0..255")
     return ap.parse_args()
 
 
@@ -301,6 +238,17 @@ def main():
 
     arduino = None if args.no_serial else ArduinoLink(args.port)
     speaker = None if args.no_tts else Speaker()
+
+    teleop = None
+    if args.drive:
+        if arduino is None:
+            raise SystemExit("--drive needs the Arduino, so it can't be used with --no-serial.")
+        teleop = KeyboardTeleop(args.speed, args.hold)
+        has_terminal = teleop.start()  # keys typed in the terminal (works over SSH)
+        if not has_terminal and args.headless:
+            raise SystemExit("--drive --headless needs an interactive terminal for the keys.")
+        print("Driving: w/a/s/d or arrows, x/space = stop, +/- = speed"
+              + ("" if args.headless else " (keys work in the terminal or the camera window)"))
 
     # State
     baseline = None
@@ -381,6 +329,9 @@ def main():
                 # Output
                 if arduino:
                     arduino.send(status)
+                    if teleop:
+                        arduino.drive(*teleop.wheel_speeds())
+                    arduino.poll()
                 if status != prev_status:
                     print(f"{time.strftime('%H:%M:%S')}  {status}"
                           f"  (PERCLOS {perclos * 100:.0f}%, yawns {len(yawn_times)})")
@@ -401,7 +352,7 @@ def main():
                         cv2.circle(frame, tuple(pts[i].astype(int)), 2, (255, 255, 0), -1)
                 colour = COLOURS[status]
                 darken(frame, 0, 0, min(w, 420), 215)
-                darken(frame, 0, h - 35, min(w, 360), h)
+                darken(frame, 0, h - (60 if teleop else 35), min(w, 360), h)
                 put(frame, status, 40, colour, scale=1.1, thickness=2)
                 if status == "CALIBRATING":
                     put(frame, "Look at the camera with your eyes open", 70)
@@ -415,6 +366,8 @@ def main():
                 link = "off" if not arduino else ("ok" if arduino.ser else "--")
                 put(frame, f"q: quit  c: recalibrate  {fps:.0f} FPS  Arduino {link}",
                     h - 15, (180, 180, 180), scale=0.5)
+                if teleop:
+                    put(frame, f"Drive: {teleop.describe()}", h - 40, (255, 255, 255), scale=0.5)
                 if status == "DROWSY":
                     cv2.rectangle(frame, (0, 0), (w - 1, h - 1), colour, 12)
 
@@ -427,10 +380,14 @@ def main():
                     eye_samples.clear()
                     yawn_times.clear()
                     closed_since = yawn_since = None
+                elif teleop and key != 255:
+                    teleop.handle_key(chr(key))
     except KeyboardInterrupt:
         pass
     finally:
-        if arduino:
+        if teleop:
+            teleop.close()  # restores the terminal
+        if arduino:  # close() also sends a stop to the motors
             arduino.close()
         if speaker:
             speaker.close()
